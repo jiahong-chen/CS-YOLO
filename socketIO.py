@@ -58,8 +58,10 @@ class Socket:
 
     def send(self, data):
         if isinstance(data, np.ndarray):
+            type_ = 'frame'
             out = self.__pack_frame(data)
         else:
+            type_ = 'text'
             out = pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL)
 
         socket = self.socket
@@ -68,10 +70,10 @@ class Socket:
 
         try:
             socket.sendall(out)
+            logging.info(f'[Info] Send {type_} successfully.')
         except BrokenPipeError:
             logging.error('[Error] Connection broken.')
             raise
-        logging.info('[Info] Send frame successfully.')
 
     def recieve_frame(self, socket_buffer_size=1024):
         socket = self.socket
@@ -104,5 +106,5 @@ class Socket:
         socket = self.socket
         if(self.client_conn):
             socket = self.client_conn
-        logging.info('[Info] Receive frame successfully.')
+        logging.info('[Info] Receive text successfully.')
         return pickle.loads(socket.recv(socket_buffer_size))
