@@ -1,4 +1,5 @@
 import os
+from re import T
 import cv2
 import time
 import uuid
@@ -19,17 +20,6 @@ from multiprocessing.pool import ThreadPool
 from multiprocessing import Process, Queue, Lock
 
 
-def timeit(f):
-    def timed(*args, **kw):
-        ts = time.time()
-        result = f(*args, **kw)
-        te = time.time()
-        # print('func:{} args:[{}, {}] took:{:.4f} sec'.format(f.__name__, args, kw, te-ts))
-        print('func:{} took:{:.8f} sec'.format(f.__name__, te-ts))
-        return result
-    return timed
-
-
 @dataclass
 class RtspProxy():
     mode: str
@@ -41,8 +31,9 @@ class RtspProxy():
     def __post_init__(self) -> None:
         self.lock = Lock()
         self.processes = list()
+        self.queues = [self.original_image_queue, self.yuv_image_queue, self.detections_queue]
         logging.basicConfig(
-            level=logging.ERROR,
+            level=logging.INFO,
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
@@ -50,7 +41,7 @@ class RtspProxy():
 
     def cap_camera_frame(self, url:str, original_image_queue:Queue, yuv_image_queue:Queue, lock:Lock) -> None:
         camera = cv2.VideoCapture(url)
-        fpsLimit = 0.0001
+        fpsLimit = 0.1
         st = time.time()
         while camera.isOpened():
             ret, frame = camera.read()
@@ -89,15 +80,17 @@ class RtspProxy():
 
     def stop(self) -> None:
         for process in self.processes:
-            process.join()
+            process.join(timeout=1.0)
             logging.info('[Info]: Joined process successfully!') 
-
-
+        
     def interrupt(self) -> None:
+        for queue in self.queues:
+            queue.close()
+            queue.join_thread()
         for process in self.processes:
             logging.info('[Info]: Terminating slacking process. pid: {}'.format(process.name))
             process.terminate()
-            time.sleep(0.5)
+            time.sleep(1)
             if not process.is_alive():
                 logging.info('[Info]: Process is a goner.')
                 process.join(timeout=1.0)
@@ -105,13 +98,9 @@ class RtspProxy():
             else:
                 logging.info('[Info]: Joined process not successfully!') 
 
-        self.original_image_queue.close()
-        self.yuv_image_queue.close()
-        self.detections_queue.close()
-    
     def kill(self, process) -> None:
         process.terminate()
-        time.sleep(0.5)
+        time.sleep(1)
         if not process.is_alive():
             process.join(timeout=1.0)
             logging.info('[Info]: Killed process successfully!')
@@ -119,17 +108,10 @@ class RtspProxy():
     def watch_dog(self, mode, processes) -> None:
         while True:
             if mode == 'stream':
-                try:
-                    for idx, process in enumerate(processes):
-                        if not process.is_alive():
-                            raise mp.ProcessError(f'Process-{idx} was hang out.')
-                except mp.ProcessError as e:
-                    print("[Error]:", e)
-                    self.interrupt()
-            else:
-                if all([not process.is_alive() for process in processes]):
-                    self.stop()
-
+                for idx, process in enumerate(processes):
+                    if not process.is_alive():
+                        logging.error(f'Process-{idx} was hang out.')
+                        del processes[idx]
             if kbhit():
                 key = ord(getch())
                 if key in [27, 113]:
@@ -196,10 +178,9 @@ class Detection:
     def detect_persons(self, network, net_width, net_height, class_names, 
                         yuv_image_queue, detections_queue):
         while True:
-            st = time.time()
             try:
                 self.lock1.acquire()
-                yuv_image = yuv_image_queue.get()
+                yuv_image = yuv_image_queue.get(timeout=1)
                 gpu_frame = cv2.cuda_GpuMat()
                 gpu_frame.upload(yuv_image)
                 frame = cv2.cuda.cvtColor(gpu_frame, cv2.COLOR_BGR2RGB)
@@ -211,18 +192,16 @@ class Detection:
                 darknet.free_image(img_for_detect)
             finally:
                 self.lock2.release()
-            # print(f'detect persons use:{time.time()-st} sec.')
 
     def detect_objects(self, net_width, net_height,
                         original_image_queue, detections_queue):
         objects = ['hat']
         IP_list = [('127.0.0.1', 9000)]
         while True:
-            st = time.time()
             try:
                 self.lock2.acquire()
-                original_image = original_image_queue.get()
-                person_detections = detections_queue.get()
+                original_image = original_image_queue.get(timeout=1)
+                person_detections = detections_queue.get(timeout=1)
                 object_detections = list()
                 h, w, _ = original_image.shape
                 pool = ThreadPool(processes=mp.cpu_count())
@@ -240,13 +219,12 @@ class Detection:
                 pool.join()
                 show_frame = self.drawing.draw_person_boxes(person_detections, original_image, (net_width/w, net_height/h))
                 show_frame = self.drawing.draw_object_boxes(object_detections, show_frame)
-                # cv2.imwrite(f'./tmp/{str(uuid.uuid4())}.jpg', show_frame)
+                cv2.imwrite(f'./tmp/{str(uuid.uuid4())}.jpg', show_frame)
                 # cv2.imshow('img', show_frame)
                 # if cv2.waitKey(1) and 0xFF == ord('q'):
                 #     os._exit(0)
             finally:
                 self.lock1.release()
-            # print(f'detect object use:{time.time()-st} sec.')
 
     def crop_image(self, detections:tuple, original_image:np.ndarray, zoom:tuple, objects) -> tuple:
         images = list()
@@ -267,7 +245,6 @@ class Detection:
                     coord_tmp.append(coord)
             images.append(tuple(image_tmp))
             coordinates.append(tuple(coord_tmp))
-        end =time.time()
         return images, coordinates
     
     def normal_size(self, image:np.ndarray, h:int, w:int, left:int, top:int, right:int, bottom:int) -> np.ndarray:
@@ -294,7 +271,7 @@ class Detection:
 @dataclass
 class Drawing:
     colors: Dict[str, tuple]
-    @timeit
+
     def bbox2points(self, bbox:tuple, zoom:tuple) -> tuple:
         zoom_x, zoom_y = zoom
         x, y, w, h = bbox
@@ -303,7 +280,7 @@ class Drawing:
         ymin = int(round(y - (h / 2))/zoom_y)
         ymax = int(round(y + (h / 2))/zoom_y)
         return (xmin, ymin, xmax, ymax)
-    @timeit
+    
     def resize_points(self, image_coordinates:tuple, bbox_coordinates:tuple) -> tuple:
         left, top, right, bottom = bbox_coordinates
         left = left+image_coordinates[0]
@@ -311,7 +288,7 @@ class Drawing:
         right = right+image_coordinates[0]
         bottom = bottom+image_coordinates[1]
         return (left, top, right, bottom)
-    @timeit
+    
     def draw_person_boxes(self, detections:tuple, image:np.ndarray, zoom:tuple) -> np.ndarray:
         for label, confidence, bbox in detections:
             left, top, right, bottom = self.bbox2points(bbox, zoom)
@@ -320,7 +297,7 @@ class Drawing:
                         (left, top - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                         self.colors[label], 2)
         return image
-    @timeit
+    
     def draw_object_boxes(self, detections:tuple, image:np.ndarray) -> np.ndarray:
         for _, label, confidence, bbox_coordinates, image_coordinates in detections:
             left, top, right, bottom = self.resize_points(image_coordinates, bbox_coordinates)
@@ -351,6 +328,6 @@ if __name__ == '__main__':
     yuv_image_queue = Queue()
     detections_queue = Queue()
 
-    camera = [f'test{idx}.mp4' for idx in range(2, 3)]
+    camera = [f'test{idx}.mp4' for idx in range(1, 5)]
     rtsp = RtspProxy(args.mode, camera, original_image_queue, yuv_image_queue, detections_queue)
     detection = Detection(original_image_queue, yuv_image_queue, detections_queue)
